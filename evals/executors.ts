@@ -46,7 +46,7 @@ const TOOL_DEFINITIONS: any = {
   },
 };
 
-export const singleTurnExecutor = async (data: EvalData) => {
+export const singleTurnExecutorWithMocks = async (data: EvalData) => {
   const messages = buildMessages(data);
   const tools: ToolSet = {};
   for (const toolName of data.tools) {
