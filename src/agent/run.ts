@@ -1,10 +1,12 @@
 import "dotenv/config";
-import { generateText, type ModelMessage } from "ai";
+import { generateText, streamText, type ModelMessage } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { tools } from "./tools/index.ts";
 import { SYSTEM_PROMPT } from "./system/prompt.ts";
-import type { AgentCallbacks } from "../types.ts";
+import type { AgentCallbacks, ToolCallInfo } from "../types.ts";
 import { getTracer, Laminar } from "@lmnr-ai/lmnr";
+import { filterCompatibleMessages } from "./system/filterMessages.ts";
+import { executeTool } from "./executeTool.ts";
 
 const MODEL_NAME = "gpt-5-mini";
 
@@ -15,19 +17,94 @@ Laminar.initialize({
 export const runAgent = async (
   userMessage: string,
   conversationHistory: ModelMessage[],
-  callback: AgentCallbacks,
-): Promise<any> => {
-  const { text } = await generateText({
-    model: openai(MODEL_NAME),
-    prompt: userMessage,
-    system: SYSTEM_PROMPT,
-    tools,
-    experimental_telemetry: {
-      isEnabled: true,
-      tracer: getTracer(),
-    },
-  });
+  callbacks: AgentCallbacks,
+): Promise<ModelMessage[]> => {
+  const workingHistory = filterCompatibleMessages(conversationHistory);
 
-  await Laminar.flush();
-  console.log("done");
+  const messages: ModelMessage[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...workingHistory,
+    { role: "user", content: userMessage },
+  ];
+
+  let fullResponse = "";
+
+  while (true) {
+    const result = streamText({
+      model: openai(MODEL_NAME),
+      messages,
+      tools,
+      experimental_telemetry: {
+        isEnabled: true,
+        tracer: getTracer(),
+      },
+    });
+
+    const toolCalls: ToolCallInfo[] = [];
+    let currentText = "";
+    let streamError: Error | null = null;
+
+    try {
+      for await (const chunk of result.fullStream) {
+        if (chunk.type === "text-delta") {
+          currentText += chunk.text;
+          callbacks.onToken(chunk.text);
+        }
+
+        if (chunk.type === "tool-call") {
+          const input = "input" in chunk ? chunk.input : {};
+          toolCalls.push({
+            toolCallId: chunk.toolCallId,
+            toolName: chunk.toolName,
+            args: input as any,
+          });
+          callbacks.onToolCallStart(chunk.toolName, input);
+        }
+      }
+    } catch (e) {
+      streamError = e as Error;
+
+      if (
+        !currentText &&
+        !streamError.message.includes("No output generated")
+      ) {
+        throw streamError;
+      }
+    }
+
+    fullResponse += currentText;
+    if (streamError && !currentText) {
+      fullResponse = "Sorry about that.";
+      callbacks.onToken(fullResponse);
+      break;
+    }
+
+    const finnishReason = await result.finishReason;
+    if (finnishReason !== "tool-calls" && toolCalls.length === 0) {
+      const responseMessages = await result.response;
+      messages.push(...responseMessages.messages);
+      break;
+    }
+    const responseMessages = await result.response;
+    messages.push(...responseMessages.messages);
+
+    for (const tc of toolCalls) {
+      const result = await executeTool(tc.toolName, tc.toolCallId);
+      callbacks.onToolCallEnd(tc.toolName, result);
+
+      messages.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            output: { type: "text", value: "result" },
+          },
+        ],
+      });
+    }
+  }
+  callbacks.onComplete(fullResponse);
+  return messages;
 };
