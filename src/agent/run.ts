@@ -11,7 +11,7 @@ import { executeTool } from "./executeTool.ts";
 const MODEL_NAME = "gpt-5-mini";
 
 Laminar.initialize({
-  projectApiKey: process.env.LAMINAR_API_KEY,
+  projectApiKey: process.env.LMNR_PROJECT_API_KEY,
 });
 
 export const runAgent = async (
